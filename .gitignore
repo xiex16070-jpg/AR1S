@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+win-unpacked/
+
+# Installer files
+*.exe
+*.exe.blockmap
+latest.yml
+builder-debug.yml
+builder-effective-config.yaml
+
+# Package locks
+package-lock.json
+.package-lock.json
+
+# IDE and OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+server-test-out.txt
+server-test-err.txt
+
+# Env
+.env
+.env.local
+.npmrc

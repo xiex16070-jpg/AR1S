@@ -1,0 +1,17 @@
+{
+  "name": "AR1S",
+  "short_name": "AR1S",
+  "description": "AR1S - immersive music player",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#010304",
+  "theme_color": "#010304",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/build/icon.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
