@@ -34,8 +34,8 @@ AR1S 不是网易云音乐、QQ 音乐、Bilibili 或任何音乐/视频平台�
 如果这个小播放器陪你多听了几首歌，欢迎 点个 Star ⭐ 支持一下。
 软件开发与调试对一个学生来说并不容易，你的 Star 就是最好的鼓励。如果愿意请我一杯奶茶，也可以扫码捐赠，每一份支持我都记在心里 ❤️
 微信    支付宝
-    
-
+ <img width="1272" height="1682" alt="mm_facetoface_collect_qrcode_1784457957522" src="https://github.com/user-attachments/assets/e13336a1-3b22-4652-995b-40b1ca54f185" />
+<img width="1260" height="1890" alt="1785041398752" src="https://github.com/user-attachments/assets/feaba60c-03f0-49d3-81c5-efb62d974e4f" />
 致谢
 本分支基于 XxHuberrr / Mineradio 二次开发，感谢原作者的优秀作品与开源精神。
 同时也感谢小天才e宝、应春日、锋将军、軌跡、林中、骊、风痕、花椰菜🥦在原版早期体验、测试反馈和发布准备中的帮助。
