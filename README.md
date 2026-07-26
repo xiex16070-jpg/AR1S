@@ -35,20 +35,20 @@
 
 ## 安装与使用
 
-在 [Releases](https://github.com/xiex16070-jpg/AR1S/releases) 页面下载最新  + "AR1S-x.y.z-Setup.exe" + @ 安装包，双击安装即可。安装包会自动创建桌面快捷方式。
+在 [Releases](https://github.com/xiex16070-jpg/AR1S/releases) 页面下载最新 AR1S-x.y.z-Setup.exe 安装包，双击安装即可。安装包会自动创建桌面快捷方式。
 
 ---
 
 ## 开发运行
 
- + "`ash" + @
+`ash
 npm install
 npm start
 npm run build:win
- + "`" + @
+`
 
-桌面版入口由 Electron 主进程加载本地服务。 + "
-pm run build:win" + @ 生成 Windows NSIS 安装包至  + "dist/" + @。
+桌面版入口由 Electron 主进程加载本地服务。
+pm run build:win 生成 Windows NSIS 安装包至 dist/。
 
 ---
 
