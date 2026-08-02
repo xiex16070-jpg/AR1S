@@ -61,7 +61,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "XxHuberrr",
+        "owner": "xiex16070-jpg",
         "repo": "AR1S"
       }
     ]
@@ -69,7 +69,7 @@
   "ar1s": {
     "update": {
       "provider": "github",
-      "owner": "XxHuberrr",
+      "owner": "xiex16070-jpg",
       "repo": "AR1S",
       "preview": true,
       "preferMirrors": true,
