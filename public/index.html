@@ -2369,6 +2369,7 @@ body.bili-video-mode.bili-control-visible #bili-close-video{opacity:1;transform:
     <div class="queue-toolbar">
       <div class="queue-chip">扫描本地音乐文件夹</div>
       <button class="fx-mini-btn ghost" onclick="openLocalFolderScan()" style="height:26px;padding:0 10px;font-size:11px">选择文件夹</button>
+      <button class="fx-mini-btn ghost" onclick="clearLocalScan()" style="height:26px;padding:0 10px;font-size:11px" title="清空本次扫描结果与已保存记录">清空</button>
     </div>
     <div id="local-scan-status" style="margin-top:6px;color:rgba(255,255,255,.36);font-size:11.5px;padding:8px 0">选择文件夹后扫描 MP3/FLAC/WAV/OGG/M4A</div>
     <div id="local-scan-list" style="margin-top:6px"></div>
@@ -19254,35 +19255,47 @@ async function playQueueAt(idx, opts) {
       requestedQuality = qqPlaybackQualityCeiling;
     }
     var qualityParam = '&quality=' + encodeURIComponent(requestedQuality);
-    var data = isQQPlayback
-      ? await apiJson('/api/qq/song/url?mid=' + encodeURIComponent(song.mid || song.songmid || song.id || '') + '&mediaMid=' + encodeURIComponent(song.mediaMid || song.media_mid || '') + qualityParam)
-      : await apiJson('/api/song/url?id=' + song.id + qualityParam);
-    if (token !== trackSwitchToken) return;
-    if (!data.url) {
-      if (isQQPlayback && await retryQQPlaybackWithCompatibleQuality(song, idx, token, opts, data, requestedQuality)) return;
-      if (await tryAutoPlaybackFallback(song, data, idx, token, opts)) return;
-      handlePlaybackUnavailable(song, data);
-      return;
-    }
-    var resolvedQualityText = playbackResolvedQualityText(data);
-    if (!isQQPlayback && playbackQualityWasDowngraded(requestedQuality, data.level)) {
-      showSourceFallbackNotice('网易云音质自动降级', '请求 ' + playbackQualityLabel(requestedQuality) + '，实际播放 ' + resolvedQualityText + '。');
-    } else if (opts.qualitySwitch) {
-      showSourceFallbackNotice('音质已切换', '实际播放: ' + resolvedQualityText + '。');
-    }
-    if (data.trial) {
-      var txt;
-      if (data.loggedIn && data.vipLevel === 'svip') txt = '此歌曲需要单曲、专辑购买或更高权限';
-      else if (data.loggedIn && data.vipLevel === 'vip') txt = '此歌曲需要 SVIP 或购买 · 当前仅播放试听片段';
-      else if (data.loggedIn) txt = '此歌曲需 VIP · 当前仅播放试听片段';
-      else txt = '当前未登录 · 仅播放试听片段';
-      document.getElementById('trial-text').textContent = txt;
-      var trialLoginBtn = document.getElementById('trial-login-btn');
-      if (trialLoginBtn) {
-        trialLoginBtn.style.display = data.loggedIn ? 'none' : '';
-        trialLoginBtn.onclick = function(){ openProviderLogin('netease'); };
+    var data;
+    if (song.type === 'local') {
+      // 本地扫描歌曲：按需读盘生成 Blob URL，不经过 /api/song/url
+      var localUrl = await resolveLocalSongUrl(song);
+      if (token !== trackSwitchToken) return;
+      if (!localUrl) {
+        handlePlaybackUnavailable(song, { error: 'LOCAL_FILE_MISSING' });
+        return;
       }
-      document.getElementById('trial-banner').classList.add('show');
+      data = { url: localUrl, trial: false, level: 'local' };
+    } else {
+      data = isQQPlayback
+        ? await apiJson('/api/qq/song/url?mid=' + encodeURIComponent(song.mid || song.songmid || song.id || '') + '&mediaMid=' + encodeURIComponent(song.mediaMid || song.media_mid || '') + qualityParam)
+        : await apiJson('/api/song/url?id=' + song.id + qualityParam);
+      if (token !== trackSwitchToken) return;
+      if (!data.url) {
+        if (isQQPlayback && await retryQQPlaybackWithCompatibleQuality(song, idx, token, opts, data, requestedQuality)) return;
+        if (await tryAutoPlaybackFallback(song, data, idx, token, opts)) return;
+        handlePlaybackUnavailable(song, data);
+        return;
+      }
+      var resolvedQualityText = playbackResolvedQualityText(data);
+      if (!isQQPlayback && playbackQualityWasDowngraded(requestedQuality, data.level)) {
+        showSourceFallbackNotice('网易云音质自动降级', '请求 ' + playbackQualityLabel(requestedQuality) + '，实际播放 ' + resolvedQualityText + '。');
+      } else if (opts.qualitySwitch) {
+        showSourceFallbackNotice('音质已切换', '实际播放: ' + resolvedQualityText + '。');
+      }
+      if (data.trial) {
+        var txt;
+        if (data.loggedIn && data.vipLevel === 'svip') txt = '此歌曲需要单曲、专辑购买或更高权限';
+        else if (data.loggedIn && data.vipLevel === 'vip') txt = '此歌曲需要 SVIP 或购买 · 当前仅播放试听片段';
+        else if (data.loggedIn) txt = '此歌曲需 VIP · 当前仅播放试听片段';
+        else txt = '当前未登录 · 仅播放试听片段';
+        document.getElementById('trial-text').textContent = txt;
+        var trialLoginBtn = document.getElementById('trial-login-btn');
+        if (trialLoginBtn) {
+          trialLoginBtn.style.display = data.loggedIn ? 'none' : '';
+          trialLoginBtn.onclick = function(){ openProviderLogin('netease'); };
+        }
+        document.getElementById('trial-banner').classList.add('show');
+      }
     }
     markPlayPhase('audio-element');
     if (!audio) { audio = new Audio(); audio.crossOrigin = 'anonymous'; }
@@ -19293,7 +19306,8 @@ async function playQueueAt(idx, opts) {
     }
     bindPlaybackProgressEvents(audio);
     applyVolumeToAudio();
-    var proxyAudioUrl = '/api/audio?url=' + encodeURIComponent(data.url);
+    // 本地歌曲不走服务端代理，直接使用 Blob URL（服务端无法访问 blob: 协议）
+    var proxyAudioUrl = song.type === 'local' ? data.url : '/api/audio?url=' + encodeURIComponent(data.url);
     audio.src = proxyAudioUrl;
     updatePlaybackProgressUi();
     audio.onended = function(){
@@ -20116,10 +20130,80 @@ function switchPlaylistTab(tab) {
   if (tab === 'podcasts') animateVisiblePanelList(document.getElementById('podcast-list'), '.pl-card', document.getElementById('playlist-panel'));
 }
 
-//  本地文件夹扫描
+//  本地文件夹扫描（持久化：记住上次扫描的文件夹与文件列表，重启后自动恢复）
 var localScanResults = [];
+var LOCAL_SCAN_STORE_KEY = 'ar1s-local-scan-store-v1';
+var localScanStore = null;
+function loadLocalScanStore() {
+  try {
+    var raw = localStorage.getItem(LOCAL_SCAN_STORE_KEY);
+    if (!raw) return null;
+    var parsed = JSON.parse(raw);
+    if (!parsed || !parsed.folderPath || !Array.isArray(parsed.files) || !parsed.files.length) return null;
+    return parsed;
+  } catch (e) { return null; }
+}
+function saveLocalScanStore() {
+  try {
+    if (!localScanStore || !localScanStore.folderPath || !localScanStore.files || !localScanStore.files.length) {
+      localStorage.removeItem(LOCAL_SCAN_STORE_KEY);
+      return;
+    }
+    localStorage.setItem(LOCAL_SCAN_STORE_KEY, JSON.stringify(localScanStore));
+  } catch (e) { console.warn('[LocalScan] save failed:', e); }
+}
+function clearLocalScanStore() {
+  localScanStore = null;
+  saveLocalScanStore();
+}
+function updateLocalScanStatus(text) {
+  var el = document.getElementById("local-scan-status");
+  if (el) el.textContent = text;
+}
+function localScanDesktopApi() {
+  return window.desktopWindow && typeof window.desktopWindow.pickLocalMusicFolder === 'function' ? window.desktopWindow : null;
+}
+function localAudioMime(ext) {
+  var map = { mp3: "audio/mpeg", flac: "audio/flac", wav: "audio/wav", ogg: "audio/ogg", m4a: "audio/mp4" };
+  return map[String(ext || "").toLowerCase().replace(/^\./, "")] || "audio/mpeg";
+}
+// 解析本地歌曲可播放 URL：桌面端按需读盘生成 Blob URL（重启恢复的歌曲没有可用的 blob），
+// 浏览器模式直接用已有的 blob URL。
+function resolveLocalSongUrl(song) {
+  return new Promise(function(resolve){
+    if (!song) { resolve(null); return; }
+    if (song.url) { resolve(song.url); return; }
+    var api = window.desktopWindow && typeof window.desktopWindow.readLocalMusicFile === 'function' ? window.desktopWindow : null;
+    if (!api || !song.fullPath) { resolve(null); return; }
+    api.readLocalMusicFile(song.fullPath).then(function(res){
+      if (!res || !res.ok || !res.data) { resolve(null); return; }
+      try {
+        var blob = new Blob([res.data], { type: localAudioMime(song.ext || song.fileName) });
+        var url = URL.createObjectURL(blob);
+        song.url = url;
+        resolve(url);
+      } catch (e) { resolve(null); }
+    }).catch(function(){ resolve(null); });
+  });
+}
 function openLocalFolderScan() {
   switchPlaylistTab("local");
+  var api = localScanDesktopApi();
+  if (api) {
+    updateLocalScanStatus("正在读取文件夹…");
+    api.pickLocalMusicFolder().then(function(res){
+      if (!res || res.canceled) return;
+      if (!res.ok || !res.files || !res.files.length) {
+        showToast("未找到支持的音频文件 (MP3/FLAC/WAV/OGG/M4A)");
+        updateLocalScanStatus("该文件夹下未找到音频文件");
+        renderLocalScanResults();
+        return;
+      }
+      applyLocalScanMeta(res, false);
+    }).catch(function(){ showToast("读取文件夹失败，请重试"); });
+    return;
+  }
+  // 浏览器模式：webkitdirectory 选择，不持久化
   var input = document.createElement("input");
   input.type = "file";
   input.webkitdirectory = true;
@@ -20138,15 +20222,65 @@ function openLocalFolderScan() {
       showToast("未找到支持的音频文件 (MP3/FLAC/WAV/OGG/M4A)");
       return;
     }
-    var statusEl = document.getElementById("local-scan-status");
-    if (statusEl) statusEl.textContent = "找到 " + audioFiles.length + " 个音频文件，正在读取...";
+    updateLocalScanStatus("找到 " + audioFiles.length + " 个音频文件，正在读取...");
     processLocalAudioFiles(audioFiles);
   };
   input.click();
 }
+function applyLocalScanMeta(meta, isRestore) {
+  var files = meta && meta.files ? meta.files : [];
+  localScanResults = [];
+  for (var i = 0; i < files.length; i++) {
+    var f = files[i];
+    if (!f || !(f.fullPath || f.name)) continue;
+    var fileName = f.fileName || f.name || "";
+    var name = fileName.replace(/\.(mp3|flac|wav|ogg|m4a)$/i, "");
+    var extMatch = (f.fullPath || fileName).match(/\.(\w+)$/i);
+    var relPath = f.relPath || f.fullPath || "";
+    localScanResults.push({
+      name: name,
+      artist: "本地音乐",
+      provider: "local",
+      source: "local",
+      type: "local",
+      url: "", // 惰性：播放时才读盘生成 Blob URL
+      fullPath: f.fullPath || "",
+      relPath: relPath,
+      cover: "",
+      id: "local_" + relPath.replace(/[\\/]/g, "_"),
+      duration: 0,
+      ext: extMatch ? extMatch[1].toUpperCase() : "",
+      fileName: fileName,
+      size: f.size || 0
+    });
+  }
+  if (!localScanResults.length) {
+    updateLocalScanStatus("该文件夹下未找到音频文件");
+    renderLocalScanResults();
+    return;
+  }
+  localScanStore = { folderPath: meta.folderPath || "", folderName: meta.folderName || "", files: files, scannedAt: Date.now() };
+  saveLocalScanStore();
+  if (isRestore) {
+    updateLocalScanStatus("已恢复上次扫描 · " + (meta.folderName ? meta.folderName + " · " : "") + "共 " + localScanResults.length + " 首");
+  } else {
+    updateLocalScanStatus((meta.folderName ? meta.folderName + " · " : "") + "共 " + localScanResults.length + " 首本地歌曲" + (meta.truncated ? "（超过上限仅显示部分）" : "") + "，已记住该文件夹，重启后自动恢复");
+  }
+  renderLocalScanResults();
+}
+function restoreLocalScan() {
+  var store = loadLocalScanStore();
+  if (!store) return;
+  applyLocalScanMeta(store, true);
+}
+function clearLocalScan() {
+  localScanResults = [];
+  clearLocalScanStore();
+  updateLocalScanStatus("已清空本地扫描");
+  renderLocalScanResults();
+}
 function processLocalAudioFiles(files) {
   localScanResults = [];
-  var listEl = document.getElementById("local-scan-list");
   var statusEl = document.getElementById("local-scan-status");
   var processed = 0;
   for (var i = 0; i < files.length; i++) {
@@ -20200,9 +20334,17 @@ function renderLocalScanResults() {
 function playLocalScanResult(i) {
   var song = localScanResults[i];
   if (!song) return;
-  // 直接使用 blob URL 播放本地文件（参照拖拽播放模式）
+  resolveLocalSongUrl(song).then(function(url){
+    if (!url) {
+      showToast("本地文件不可用，可能已被移动或删除");
+      return;
+    }
+    startLocalScanPlayback(song, url);
+  });
+}
+function startLocalScanPlayback(song, url) {
+  // 使用 Blob URL 播放本地文件（桌面端按需读盘生成）
   finalizeListenSession(false);
-  var url = song.url;
   trackSwitchToken++;
   var token = trackSwitchToken;
   if (localBeatAnalysis.active) cancelLocalBeatAnalysis();
@@ -20275,6 +20417,8 @@ function queueLocalScanResult(i) {
   safeRenderQueuePanel("local queue");
   showToast("已添加到下一首");
 }
+
+if (document.readyState === "loading") { document.addEventListener("DOMContentLoaded", restoreLocalScan); } else { restoreLocalScan(); }
 
 function setMiniQueueOpen(open) {
   miniQueueOpen = !!open;

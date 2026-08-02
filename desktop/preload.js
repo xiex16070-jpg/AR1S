@@ -19,6 +19,8 @@ contextBridge.exposeInMainWorld('desktopWindow', {
   configureGlobalHotkeys: (bindings) => ipcRenderer.invoke('ar1s-hotkeys-configure-global', bindings || []),
   exportJsonFile: (payload) => ipcRenderer.invoke('ar1s-export-json-file', payload || {}),
   importJsonFile: () => ipcRenderer.invoke('ar1s-import-json-file'),
+  pickLocalMusicFolder: () => ipcRenderer.invoke('ar1s-local-scan-pick-folder'),
+  readLocalMusicFile: (filePath) => ipcRenderer.invoke('ar1s-local-scan-read-file', String(filePath || '')),
   onGlobalHotkey: (callback) => {
     if (typeof callback !== 'function') return () => {};
     const listener = (_event, payload) => callback(payload || {});

@@ -1288,6 +1288,81 @@ ipcMain.handle('ar1s-import-json-file', async (event) => {
   }
 });
 
+const LOCAL_AUDIO_EXTS = new Set(['.mp3', '.flac', '.wav', '.ogg', '.m4a']);
+const LOCAL_SCAN_MAX_FILES = 3000;
+const LOCAL_SCAN_SKIP_DIRS = new Set(['node_modules', '.git', '.svn', '$RECYCLE.BIN', 'System Volume Information']);
+
+function scanLocalAudioFolder(rootPath) {
+  const files = [];
+  const stack = [rootPath];
+  while (stack.length && files.length < LOCAL_SCAN_MAX_FILES) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (files.length >= LOCAL_SCAN_MAX_FILES) break;
+      if (entry.isDirectory()) {
+        if (!LOCAL_SCAN_SKIP_DIRS.has(entry.name)) stack.push(path.join(dir, entry.name));
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (!LOCAL_AUDIO_EXTS.has(path.extname(entry.name).toLowerCase())) continue;
+      const fullPath = path.join(dir, entry.name);
+      let stat = null;
+      try { stat = fs.statSync(fullPath); } catch (e) {}
+      files.push({
+        name: entry.name,
+        fileName: entry.name,
+        fullPath,
+        relPath: path.relative(rootPath, fullPath),
+        size: stat ? stat.size : 0,
+        mtime: stat ? stat.mtimeMs : 0,
+      });
+    }
+  }
+  return files;
+}
+
+ipcMain.handle('ar1s-local-scan-pick-folder', async (event) => {
+  try {
+    const owner = getSenderWindow(event);
+    const result = await dialog.showOpenDialog(owner, {
+      title: '选择本地音乐文件夹',
+      buttonLabel: '选择并扫描',
+      properties: ['openDirectory'],
+    });
+    if (result.canceled || !result.filePaths || !result.filePaths[0]) return { ok: false, canceled: true };
+    const folderPath = result.filePaths[0];
+    const files = scanLocalAudioFolder(folderPath);
+    return {
+      ok: true,
+      folderPath,
+      folderName: path.basename(folderPath) || folderPath,
+      files,
+      truncated: files.length >= LOCAL_SCAN_MAX_FILES,
+    };
+  } catch (e) {
+    return { ok: false, error: e.message || 'LOCAL_SCAN_PICK_FAILED' };
+  }
+});
+
+ipcMain.handle('ar1s-local-scan-read-file', async (_event, filePath) => {
+  try {
+    const target = path.resolve(String(filePath || ''));
+    if (!LOCAL_AUDIO_EXTS.has(path.extname(target).toLowerCase())) return { ok: false, error: 'NOT_AUDIO_FILE' };
+    const stat = await fs.promises.stat(target);
+    if (!stat.isFile()) return { ok: false, error: 'NOT_A_FILE' };
+    const data = await fs.promises.readFile(target);
+    return { ok: true, size: data.length, data };
+  } catch (e) {
+    return { ok: false, error: e.message || 'LOCAL_SCAN_READ_FAILED' };
+  }
+});
+
 ipcMain.handle('netease-music-open-login', async (event) => {
   return openNeteaseMusicLoginWindow(getSenderWindow(event));
 });
