@@ -380,3 +380,25 @@
 - 涉及文件：`docs/QQ_MUSIC_INTERFACE_NOTES.md`、`server.js`、`desktop/main.js`、`public/index.html`。
 - 关键参数/实现：区分网页账号态 `p_skey` 和播放票据 `qm_keyst`/`qqmusic_key`/`music_key`/`wxskey`；`/api/qq/login/status` 返回 `playbackKeyReady`；缺播放票据时 `104003` 归类为 `login_required`；昵称头像用 `ptnick_*` 和 `qlogo.cn` 兜底。
 - 禁止回退或改坏的点：不要再把 `p_skey` 当作完整 QQ 音乐播放授权；不要因为 QQ 资料接口 `code:1000` 就清空头像/昵称或标记未登录；修 QQ 播放前先读 `docs/QQ_MUSIC_INTERFACE_NOTES.md`。
+
+### 2026-09-08 - 本地音乐网易云歌词/封面缓存 + 队列播放 + 排序 + 开屏提速 (v1.3.1)
+
+- 用户认可/要求保留：本地音乐通过网易云登录自动匹配歌词与专辑封面并落盘缓存；本地列表播放并入统一播放队列（自动下一首 + 顺序循环/随机/单曲循环）；本地列表支持默认/名称/时间/时长/大小排序；开屏动画缩短且自动进入；节拍分析后台静默运行不弹窗。
+- 涉及文件：`server.js`（新增 `/api/local/enrich|meta|cover` 与匹配/缓存实现，缓存目录 `AR1S_LOCAL_MUSIC_DIR`）、`desktop/main.js`（注入 userData 缓存 env）、`public/index.html`（本地扫描区重写、playQueueAt 本地分支、fetchLyric 本地分支、节拍后台分析、开屏）、`package.json`/`CHANGELOG.md`。
+- 关键参数/实现：缓存键 = 路径/相对路径 + size + mtime，歌曲 `localKey/localCacheKey` 稳定复用（旧版时间戳 key 已弃）；本地播放统一走 `playLocalQueue → playQueueAt`（type==='local' 分支读盘生成 blob、缓存封面/歌词、640ms 后 `prepareLocalBeatAnalysis` 静默分析）；网易云匹配顺序 = 「我喜欢的音乐」索引(likedSongsState, 10min TTL, specialType=5 歌单或 likelist 兜底) → 云端搜索；文件名按「歌手名 - 歌曲名」拆分为 song.artist/name 展示与检索；评分以标题为主、歌手/时长辅助，歌手不一致且时长未知时宁可 no-match 不误配翻唱；no-match 缓存 7 天，「全部匹配」用 force 绕过；本地文件解码失败走 `audio.onerror` 守卫 → `skipFailedQueueItem` 明确提示并自动跳下一首（不再误报“播放被系统拦截”）；本地列表 60 行起分批渲染 + IntersectionObserver；排序选择存 `ar1s-local-sort-v1`；开屏正常模式 ~1.56s 自动进入、reduce-motion ~0.6s，点击/回车可立即跳过。
+- 禁止回退或改坏的点：不要把本地播放退回旧 startLocalScanPlayback 独立路径（会失去自动下一首与模式）；不要恢复节拍分析自动弹窗；不要再把 localKey 改回 Date.now 时间戳（会破坏节拍/封面/歌词跨重启缓存）；本地列表不要回到一次性全量渲染；歌词/封面只在网易云已登录且匹配成功时写入，禁止无脑匹配翻唱版本。
+
+### 2026-10-03 - 设置持久化根因 + 开屏白粉炫彩 + B站收藏夹迁入歌单面板 + Hero 背景图 + 壁纸模式落地 (v1.3.1)
+
+- 用户认可/要求保留：设置（尤其粒子特效类开关）必须跨重启保留；开屏要白粉炫彩且不要「点击进入」；B 站收藏夹入口放在左侧歌单队列区、不要「我的播客」；Hero 上传的背景图要鲜艳不发暗；切 B 站搜索模式要提醒；播 B 站视频时收起主页杂项；DIY 壁纸模式要真的全屏背景图 + 歌词。
+- 涉及文件：`public/index.html`（唯一前端，全部改动内联其中）、`server.js`（新增 `/api/local/scan-store`）、`desktop/main.js`（`findStablePort` + 壁纸窗口止血）、`CHANGELOG.md`、本文件。
+- 关键参数/实现：
+  - 持久化根因：`readSavedLyricLayout()` 返回字面量里 `wallpaperMode: fx.wallpaperMode === true` 裸读尚未初始化的模块级 `fx` → 每次启动抛 TypeError 被 `catch` 吞掉 → 所有 FX/歌词设置回默认。改为 `raw.wallpaperMode === true`；并把 `particleLyrics/floatLayer/aiDepth/backCover` 补进读写两张表，`videoPlayMode` 不再硬编码 false；`toggleLyricsPanel()`、`applyUserFxArchive()` 补 `saveLyricLayout()`。
+  - 视频播放模式：`VIDEO_PARTICLE_KEYS = ['floatLayer','cinema','bloom','edge','lyricGlowParticles']`，`saveParticlesState/restoreParticlesState/disableParticlesForVideo` 成对恢复（旧实现只有关闭分支），存储值用 `fxPersistFlag` 兜底 → 进过 B 站视频模式不再永久关掉粒子。
+  - 本地扫描丢失：扫描存档 `ar1s-local-scan-store-v1` 只存 localStorage（~5MB 配额 + origin 随端口变化）→ 新增服务端镜像 `GET/POST /api/local/scan-store`（文件 `LOCAL_MUSIC_DIR/scan-store.json`），`saveLocalScanStore()` 双写、`restoreLocalScan()` 读不到时从服务端恢复；`desktop/main.js` 新增 `findStablePort(3000)`（先重试约 2.5s 再退避），避免端口漂移换 origin 导致「设置像被清空」。
+  - 开屏：`#splash` 与着色器整体改为白底 + 玫粉/紫罗兰/冰蓝虹彩（`ch1=(1.00,0.36,0.68) ch2=(0.72,0.42,1.00) ch3=(0.48,0.90,1.00)`；fragment 尾部用 `ink = mix(mix(sumTint, domTint, 0.55), vec3(1.00,0.38,0.70), 0.16)` + `density` 往白纸上「上墨」，不再做暗底叠加 tonemap）；新增 `var splashTimeScale = 1.8;` 压缩时间轴，`setTimeout(markSplashReadyToEnter, 2020)` + `setTimeout(requestSplashEnter, 260)` 自动进入；删除「点击进入」DOM 与相关 CSS。
+  - 歌单面板：删除 `#top-right` 的 `#bili-login-btn`；`#tab-podcast`/`#podcast-pane` 替换为 `#tab-bilifav`/`#bilifav-pane`（内含 `#bilifav-chip`/`#bilifav-login-btn`/`#bilifav-refresh-btn`/`#bilifav-list`）；新增 `renderBiliFavPane/openBiliFavFolder/closeBiliFavFolder/playBiliFavVideo/syncBiliFavPaneLoginState`，收藏夹卡片只传 `media_id`（标题在函数内查表，避免引号破坏内联 onclick）；`switchPlaylistTab`/`openPlaylistPanelTab` 归一化改为 `'bilifav'`。
+  - Hero 背景图：`.home-hero-bg.has-bg{opacity:1;filter:saturate(1.14) contrast(1.05) brightness(1.03)}`（原 0.62，正是「发暗」的直接原因），可读性改由压在图片之上的 `HOME_HERO_BG_SCRIM` 渐变保证；5 处设置 backgroundImage 统一走 `applyHomeHeroBgImage()`；上传成功判定改为 `resp.ok && resp.url`（服务端超 30MB 时返回 `{ok:false,error:'FILE_TOO_LARGE'}` 但 HTTP 仍是 200）。
+  - B 站相关：`maybeShowBiliModeNotice()`（切到 bili 搜索模式时 `showSourceFallbackNotice`，5s 自动关，`hideBiliModeNoticeIfOurs()` 避免误关真正的换源提示）；`body.bili-video-mode #empty-home` 纯 CSS 收起主页杂项，`goHome()` 加视频模式守卫。
+  - 壁纸模式：新增 `#wp-overlay`（fixed inset:0 z-index:64，含 `#wp-overlay-bg/video/veil/inner`），`applyWallpaperOverlay(on)` 只切 DOM/class，`applyWallpaperModeState()` 先本地生效再走 IPC；歌词卡拉OK用单元素 `-webkit-background-clip:text` + `--wp-p` 变量，`filter:drop-shadow` 而非 text-shadow；主进程 `wallpaperSuppressed/wallpaperAttached` 止血（attach 失败即压制、窗口关闭后置 `enabled:false`，杜绝每 ~1.6s 重建全屏窗）。
+- 禁止回退或改坏的点：不要把 `readSavedLyricLayout()` 里的 `raw.*` 改回裸 `fx.*`；不要为「修 Hero 变暗」去抬高 `.home-hero` 底色 alpha 或 `::before` 的 opacity（那是 `.home-hero/.home-card/.home-tile/.home-mosaic-cell` 共用的玻璃基线，会连累整个主页）；不要恢复 `#top-right` 的 B 站按钮或「我的播客」标签；不要让 `enterBiliVideoMode()` 调用 `dismissHomePage()`（会把 `homeSuppressed` 置上，退出视频后主页回不来）；不要删掉 `#wp-overlay` 上的点击/ESC 关闭兜底（不透明全屏层必须永远关得掉）；壁纸模式的 `wallpaperAttached/wallpaperSuppressed` 守卫不要退回「每 tick setBounds + 自动重建」。

@@ -19,6 +19,8 @@ let desktopLyricsHotBounds = null;
 let desktopLyricsLastMiddleAt = 0;
 let wallpaperWindow = null;
 let wallpaperState = {};
+let wallpaperAttached = false;    // 是否已经 SetParent 到 WorkerW（挂上之后不再反复 setBounds）
+let wallpaperSuppressed = false;  // 窗口自行关闭过：停止自动重建，直到用户重新开关一次
 let htmlFullscreenActive = false;
 let windowFullscreenActive = false;
 let mainWindowStateTimer = null;
@@ -125,6 +127,22 @@ function findOpenPort(startPort) {
 
     tryPort(startPort);
   });
+}
+
+// 优先守住 3000：localStorage 按 origin（含端口）隔离，端口一变所有设置与本地扫描存档
+// 都会像被清空。上一个实例刚退出时 socket 可能还没释放，所以先重试一会儿再退避到 port+1。
+async function findStablePort(startPort, attempts = 10, delayMs = 250) {
+  for (let i = 0; i < attempts; i++) {
+    const port = await new Promise((resolve) => {
+      const tester = net.createServer();
+      tester.once('error', () => resolve(null));
+      tester.once('listening', () => tester.close(() => resolve(startPort)));
+      tester.listen(startPort, '127.0.0.1');
+    });
+    if (port) return port;
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return findOpenPort(startPort);
 }
 
 function waitForServer(server) {
@@ -1110,8 +1128,8 @@ function nativeWindowHandleDecimal(win) {
   return String(handle.readUInt32LE(0));
 }
 
-function attachWallpaperToWorkerW(win) {
-  if (process.platform !== 'win32' || !win || win.isDestroyed()) return;
+function attachWallpaperToWorkerW(win, done) {
+  if (process.platform !== 'win32' || !win || win.isDestroyed()) { if (done) done(false); return; }
   const hwnd = nativeWindowHandleDecimal(win);
   const script = `
 $ErrorActionPreference = "Stop"
@@ -1153,6 +1171,7 @@ $target = [IntPtr]::new([Int64]${hwnd})
     timeout: 5000,
   }, (error) => {
     if (error) console.warn('Wallpaper WorkerW attach failed:', error.message);
+    if (done) done(!error);
   });
 }
 
@@ -1169,8 +1188,14 @@ function sendWallpaperState() {
 
 function createWallpaperWindow(payload = {}) {
   wallpaperState = { ...wallpaperState, ...payload, enabled: true };
+  // 窗口自行消失过一次后不再自动重建，等用户重新开关一次（见 closed 处理里的说明）
+  if (wallpaperSuppressed) {
+    return wallpaperWindow && !wallpaperWindow.isDestroyed() ? wallpaperWindow : null;
+  }
   if (wallpaperWindow && !wallpaperWindow.isDestroyed()) {
-    positionWallpaperWindow();
+    // 已经挂到 WorkerW 上之后不要再反复 setBounds：给改过父窗口的 HWND 持续施加 bounds
+    // 会让共享 GPU 进程的合成目标失效，主窗口会停止绘制（硬冻结）。
+    if (!wallpaperAttached) positionWallpaperWindow();
     sendWallpaperState();
     return wallpaperWindow;
   }
@@ -1199,13 +1224,34 @@ function createWallpaperWindow(payload = {}) {
   wallpaperWindow.once('ready-to-show', () => {
     if (!wallpaperWindow || wallpaperWindow.isDestroyed()) return;
     positionWallpaperWindow();
-    wallpaperWindow.showInactive();
-    attachWallpaperToWorkerW(wallpaperWindow);
-    sendWallpaperState();
+    // 先把窗口挂到 WorkerW（桌面层级）再显示：挂的过程中窗口保持隐藏，
+    // 不会出现「一整块不透明黑屏盖住桌面」的假死观感。
+    attachWallpaperToWorkerW(wallpaperWindow, (ok) => {
+      if (!wallpaperWindow || wallpaperWindow.isDestroyed()) return;
+      if (ok) {
+        wallpaperAttached = true;
+        wallpaperWindow.showInactive();
+        sendWallpaperState();
+      } else {
+        // 挂不上 WorkerW（Explorer 变动 / 权限 / PowerShell 不可用）就把这扇全屏不透明
+        // 窗口关掉，否则它会永远盖在桌面之上，用户看到的就是「点了壁纸模式就卡死」。
+        // 渲染进程里的 #wp-overlay 仍然提供全屏背景 + 歌词，功能不受影响。
+        console.warn('Wallpaper WorkerW attach unavailable; renderer overlay only');
+        wallpaperSuppressed = true;
+        wallpaperWindow.close();
+      }
+    });
   });
   wallpaperWindow.webContents.once('did-finish-load', sendWallpaperState);
   wallpaperWindow.on('closed', () => {
     wallpaperWindow = null;
+    wallpaperAttached = false;
+    // 窗口自行关闭（Explorer 重启 / Win+D 销毁 WorkerW 连带子窗 / Alt+F4 / GPU 复位）时
+    // 必须就地停掉，否则客户端每 320ms 推一次 enabled:true，会变成每 ~1.6s 重建一个全屏
+    // 不透明窗口并重跑一次 PowerShell Add-Type 编译，永不停止 —— 这是「点壁纸模式像卡死」
+    // 的主因。前端本身有 #wp-overlay 全屏层，主进程窗口掉了不影响用户看到的效果。
+    wallpaperSuppressed = true;
+    wallpaperState = { ...wallpaperState, enabled: false };
   });
   wallpaperWindow.loadURL(overlayUrl('wallpaper.html')).catch((e) => console.warn('Wallpaper load failed:', e.message));
   return wallpaperWindow;
@@ -1502,6 +1548,8 @@ ipcMain.handle('ar1s-desktop-lyrics-move-by', async (_event, dx, dy) => {
 
 ipcMain.handle('ar1s-wallpaper-set-enabled', async (_event, enabled, payload) => {
   try {
+    // 用户的显式开关动作：清掉「自行关闭过」的抑制状态，让它有机会重新建窗
+    wallpaperSuppressed = false;
     if (enabled) createWallpaperWindow(payload || {});
     else closeWallpaperWindow();
     return { ok: true };
@@ -1513,13 +1561,12 @@ ipcMain.handle('ar1s-wallpaper-set-enabled', async (_event, enabled, payload) =>
 ipcMain.handle('ar1s-wallpaper-update', async (_event, payload) => {
   try {
     wallpaperState = { ...wallpaperState, ...(payload || {}) };
-    if (wallpaperState.enabled) {
+    // 320ms 心跳：只在窗口确实不存在时建一次，并且绝不在抑制状态下重建
+    if (wallpaperState.enabled && !wallpaperWindow && !wallpaperSuppressed) {
       createWallpaperWindow(wallpaperState);
-      if (wallpaperWindow && !wallpaperWindow.isDestroyed()) {
-        positionWallpaperWindow();
-        sendWallpaperState();
-      }
-    } else if (wallpaperWindow && !wallpaperWindow.isDestroyed()) {
+    }
+    if (wallpaperWindow && !wallpaperWindow.isDestroyed()) {
+      if (!wallpaperAttached) positionWallpaperWindow();
       sendWallpaperState();
     }
     return { ok: true };
@@ -1531,7 +1578,7 @@ ipcMain.handle('ar1s-wallpaper-update', async (_event, payload) => {
 async function createWindow() {
   htmlFullscreenActive = false;
   windowFullscreenActive = false;
-  const port = await findOpenPort(3000);
+  const port = await findStablePort(3000);
   mainServerPort = port;
 
   process.env.HOST = '127.0.0.1';
@@ -1539,6 +1586,7 @@ async function createWindow() {
   process.env.COOKIE_FILE = path.join(app.getPath('userData'), '.cookie');
   process.env.QQ_COOKIE_FILE = path.join(app.getPath('userData'), '.qq-cookie');
   process.env.AR1S_UPDATE_DIR = getUpdateDownloadDir();
+  process.env.AR1S_LOCAL_MUSIC_DIR = path.join(app.getPath('userData'), 'local-music-cache');
   try {
     const legacyQQCookie = path.join(__dirname, '..', '.qq-cookie');
     if (fs.existsSync(legacyQQCookie)) {

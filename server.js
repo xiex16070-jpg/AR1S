@@ -3549,6 +3549,502 @@ async function biliNormalizeCookieInput(cookieText) {
 }
 
 // ====================================================================
+//  本地音乐 · 网易云歌词/封面匹配缓存
+//   本地文件按 (路径/名称 + 大小 + mtime) 生成缓存键, 匹配网易云后把
+//   歌词与专辑封面缓存在 userData/local-music-cache 下, 离线/重启直接命中。
+// ====================================================================
+const LOCAL_MUSIC_DIR = process.env.AR1S_LOCAL_MUSIC_DIR || path.join(__dirname, '.local-music-cache');
+const LOCAL_META_DIR = path.join(LOCAL_MUSIC_DIR, 'meta');
+const LOCAL_COVER_DIR = path.join(LOCAL_MUSIC_DIR, 'covers');
+const LOCAL_ENRICH_NOMATCH_TTL_MS = 7 * 24 * 3600 * 1000; // 无匹配记录 7 天后允许重试
+const LOCAL_MATCH_MIN_TITLE_RATIO = 0.86;
+
+function localMusicDirKey(rawKey) {
+  const key = String(rawKey || '').slice(0, 1200);
+  return crypto.createHash('sha1').update('ar1s-local:' + key).digest('hex');
+}
+function ensureLocalMusicDirs() {
+  try {
+    fs.mkdirSync(LOCAL_META_DIR, { recursive: true });
+    fs.mkdirSync(LOCAL_COVER_DIR, { recursive: true });
+  } catch (e) {}
+}
+function localMetaFilePath(key) {
+  ensureLocalMusicDirs();
+  return path.join(LOCAL_META_DIR, localMusicDirKey(key) + '.json');
+}
+function localCoverFilePath(key) {
+  ensureLocalMusicDirs();
+  return path.join(LOCAL_COVER_DIR, localMusicDirKey(key) + '.jpg');
+}
+function readLocalMusicMeta(key) {
+  try {
+    const p = localMetaFilePath(key);
+    if (!fs.existsSync(p)) return null;
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+function writeLocalMusicMeta(key, meta) {
+  try {
+    const p = localMetaFilePath(key);
+    const tmp = p + '.tmp-' + Date.now();
+    fs.writeFileSync(tmp, JSON.stringify(meta));
+    fs.renameSync(tmp, p);
+  } catch (e) {
+    console.warn('[LocalEnrich] write meta failed:', e.message);
+  }
+}
+function stripAudioExtName(fileName) {
+  return String(fileName || '')
+    .replace(/\.(mp3|flac|wav|ogg|m4a|aac|ape|opus|wma)$/i, '')
+    .replace(/[_\s]+$/g, '')
+    .trim();
+}
+// 文件名带连字符时按用户库习惯主猜 "歌手 - 歌名"(右段=歌名), 反向作为备选
+function buildLocalMatchAttempts(baseTitle, artistHint) {
+  const out = [];
+  const push = (t, a) => {
+    t = String(t || '').trim();
+    a = String(a || '').trim();
+    if (!t) return;
+    const key = t + '\u0001' + a;
+    if (!out.some(o => o.title + '\u0001' + o.artist === key)) out.push({ title: t, artist: a });
+  };
+  push(baseTitle, artistHint);
+  const sepMatch = String(baseTitle || '').match(/^(.{1,80}?)\s*(?:-|–|—|~|～)\s*(.{1,140})$/);
+  if (sepMatch && sepMatch[1].trim() && sepMatch[2].trim()) {
+    push(sepMatch[2].trim(), sepMatch[1].trim()); // 歌手 - 歌名
+    push(sepMatch[1].trim(), sepMatch[2].trim()); // 歌名 - 歌手
+  } else if (String(baseTitle || '').indexOf('-') > 0) {
+    const dashIdx = String(baseTitle).indexOf('-');
+    const left = String(baseTitle).slice(0, dashIdx).trim();
+    const right = String(baseTitle).slice(dashIdx + 1).trim();
+    if (left && right && left.length <= 80) {
+      push(right, left);
+      push(left, right);
+    }
+  }
+  if (!out.length) out.push({ title: String(baseTitle || '').trim(), artist: '' });
+  return out;
+}
+// 网易云“我喜欢的音乐”快速复用: 用户的喜欢列表里已有正式版歌词/封面,
+// 本地文件先在喜欢列表里做本地匹配(零云端搜索开销, 命中率最高)
+const LOCAL_LIKED_TTL_MS = 10 * 60 * 1000;
+const LOCAL_LIKED_MAX_TRACKS = 2000;
+const likedSongsState = { list: [], loadedAt: 0, loading: null, failedAt: 0 };
+async function fetchNeteaseLikedSongsIndex() {
+  const login = await getLoginInfo();
+  if (!login || !login.loggedIn || !login.userId) return [];
+  let likedPlaylistId = '';
+  try {
+    for (let offset = 0; offset <= 60 && !likedPlaylistId; offset += 60) {
+      const plRes = await user_playlist({ uid: login.userId, limit: 60, offset, cookie: userCookie, timestamp: Date.now() });
+      const pls = (plRes.body && plRes.body.playlist) || [];
+      const fav = pls.find(p => p && Number(p.specialType) === 5)
+        || pls.find(p => p && /我喜欢的音乐/.test(p.name || '') && p.subscribed === false && p.creator && String(p.creator.userId) === String(login.userId));
+      if (fav && fav.id) likedPlaylistId = String(fav.id);
+    }
+  } catch (e) {
+    console.warn('[LikedIndex] find playlist failed:', e.message);
+  }
+  const out = [];
+  try {
+    if (likedPlaylistId) {
+      for (let offset = 0; offset < LOCAL_LIKED_MAX_TRACKS; offset += 500) {
+        const chunk = await playlist_track_all({ id: likedPlaylistId, limit: 500, offset, cookie: userCookie, timestamp: Date.now() });
+        const songs = (chunk.body && (chunk.body.songs || chunk.body.tracks)) || [];
+        if (!songs.length) break;
+        songs.forEach(s => {
+          if (!s || s.id == null) return;
+          const artists = (Array.isArray(s.ar) ? s.ar : []).map(a => a.name || '');
+          const album = s.al || s.album || {};
+          out.push({
+            id: s.id,
+            name: s.name || '',
+            artist: artists.join(' / '),
+            album: album.name || '',
+            cover: album.picUrl || album.coverUrl || '',
+            duration: s.dt || s.duration || 0,
+          });
+        });
+        if (songs.length < 500) break;
+      }
+    } else {
+      const ll = await likelist({ uid: login.userId, cookie: userCookie, timestamp: Date.now() });
+      const ids = ((ll.body && (ll.body.ids || ll.body.id)) || []).slice(0, 1500);
+      if (Array.isArray(ids) && ids.length) {
+        for (let i = 0; i < ids.length && i < 1500; i += 200) {
+          const part = ids.slice(i, i + 200);
+          const dd = await song_detail({ ids: part.join(','), cookie: userCookie, timestamp: Date.now() });
+          const songs = (dd.body && dd.body.songs) || [];
+          songs.forEach(s => {
+            if (!s || s.id == null) return;
+            const artists = (Array.isArray(s.ar) ? s.ar : []).map(a => a.name || '');
+            const album = s.al || s.album || {};
+            out.push({
+              id: s.id,
+              name: s.name || '',
+              artist: artists.join(' / '),
+              album: album.name || '',
+              cover: album.picUrl || album.coverUrl || '',
+              duration: s.dt || s.duration || 0,
+            });
+          });
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[LikedIndex] fetch tracks failed:', e.message);
+  }
+  return out;
+}
+function getNeteaseLikedSongsIndex(force) {
+  const now = Date.now();
+  if (likedSongsState.loading) return likedSongsState.loading;
+  if (force
+    || !likedSongsState.list.length
+    || now - likedSongsState.loadedAt > LOCAL_LIKED_TTL_MS) {
+    likedSongsState.loading = fetchNeteaseLikedSongsIndex()
+      .then(list => {
+        likedSongsState.list = list;
+        likedSongsState.loadedAt = Date.now();
+        return list;
+      })
+      .catch(err => {
+        console.warn('[LikedIndex] failed:', err.message);
+        likedSongsState.failedAt = Date.now();
+        return likedSongsState.list;
+      })
+      .finally(() => { likedSongsState.loading = null; });
+    return likedSongsState.loading;
+  }
+  return Promise.resolve(likedSongsState.list);
+}
+function matchLocalSongInLiked(likedSongs, title, artistGuess, durationMs) {
+  if (!likedSongs || !likedSongs.length || !title) return null;
+  let best = null;
+  let bestScore = -1;
+  for (const s of likedSongs) {
+    if (!s || !s.name) continue;
+    const tR = localBigramRatio(title, s.name);
+    if (tR < 0.5) continue;
+    const aR = localArtistHitRatio(artistGuess, s.artist);
+    let score = tR * 100;
+    if (artistGuess) score += (aR - 0.5) * 30;
+    if (durationMs > 0) {
+      const d = Math.abs((s.duration || 0) - durationMs);
+      score += d <= 1800 ? 8 : (d <= 6000 ? 3 : -14);
+    }
+    if (score > bestScore) { bestScore = score; best = { song: s, tR, aR }; }
+  }
+  if (!best) return null;
+  if (best.tR < 0.92) return null;
+  // 喜欢列表同样要校验歌手: 同名不同歌手不误配
+  if (artistGuess && best.aR < 0.5) return null;
+  return best.song;
+}
+function localNormText(v) {
+  return String(v || '')
+    .toLowerCase()
+    .replace(/[\s\u3000·•・,.，。!！?？、()（）[\]【】{}"'“”‘’\-_~～|｜/\\:：;；+*]/g, '')
+    .trim();
+}
+function localBigramRatio(a, b) {
+  const na = localNormText(a);
+  const nb = localNormText(b);
+  if (!na || !nb) return 0;
+  if (na === nb) return 1;
+  if (na.includes(nb) || nb.includes(na)) return Math.min(na.length, nb.length) / Math.max(na.length, nb.length);
+  const grams = (s) => {
+    const out = {};
+    for (let i = 0; i + 1 < s.length; i++) {
+      const g = s.substr(i, 2);
+      out[g] = (out[g] || 0) + 1;
+    }
+    return out;
+  };
+  const ga = grams(na);
+  const gb = grams(nb);
+  let common = 0;
+  for (const g in ga) if (gb[g]) common += Math.min(ga[g], gb[g]);
+  return (2 * common) / Math.max(1, na.length + nb.length);
+}
+function localArtistHitRatio(fileArtist, candArtist) {
+  const a = localNormText(fileArtist);
+  const b = localNormText(candArtist);
+  if (!a) return 0.5; // 没有歌手信息 → 中性, 不扣分
+  if (!b) return 0;
+  if (a === b) return 1;
+  if (a.includes(b) || b.includes(a)) return 0.88;
+  return localBigramRatio(a, b);
+}
+// 在网易云搜索结果里挑最匹配的一首 (标题为主, 歌手/时长辅助)
+function pickBestNeteaseMatch(songs, title, artistGuess, durationMs) {
+  if (!songs || !songs.length) return null;
+  let best = null;
+  let bestScore = -1;
+  for (const s of songs) {
+    const candName = s.name || '';
+    const candArtist = (Array.isArray(s.ar) ? s.ar.map(a => a.name || '').join(' / ') : (s.artists || []).map(a => a.name || '').join(' / ')) || '';
+    const tR = localBigramRatio(title, candName);
+    if (tR < 0.5) continue;
+    const aR = localArtistHitRatio(artistGuess, candArtist);
+    let score = tR * 100;
+    if (artistGuess) score += (aR - 0.5) * 30;
+    if (durationMs > 0) {
+      const candDur = s.dt || s.duration || 0;
+      const d = Math.abs(candDur - durationMs);
+      score += d <= 1800 ? 8 : (d <= 6000 ? 3 : -14);
+    }
+    score += Math.max(0, 10 - candName.length) * 0.2;
+    if (score > bestScore) {
+      bestScore = score;
+      best = { song: s, candName, candArtist, tR, aR };
+    }
+  }
+  if (!best) return null;
+  if (best.tR < LOCAL_MATCH_MIN_TITLE_RATIO) return null;
+  // 歌手不一致时, 仅当时长已知且与文件吻合(歌名完全一致)才接受, 避免误配到翻唱/纯音乐
+  if (artistGuess && best.aR < 0.45) {
+    const durKnown = Number(durationMs) > 0;
+    const durOk = durKnown && Math.abs((best.song.dt || 0) - Number(durationMs)) <= 9000;
+    if (!(best.tR >= 0.97 && durOk)) return null;
+  }
+  return best;
+}
+async function neteaseSearchBestMatch(title, artistGuess, durationMs) {
+  const keywords = [];
+  if (artistGuess) keywords.push(String(artistGuess).trim() + ' ' + String(title).trim());
+  keywords.push(String(title).trim());
+  const seen = new Set();
+  const songs = [];
+  for (const kw of keywords) {
+    if (!kw || seen.has(kw)) continue;
+    seen.add(kw);
+    try {
+      const result = await cloudsearch({ keywords: kw, limit: 15, type: 1, cookie: userCookie, timestamp: Date.now() });
+      const list = result && result.body && result.body.result && result.body.result.songs;
+      if (Array.isArray(list)) {
+        list.forEach(s => {
+          if (s && s.id != null && !seen.has('id:' + s.id)) {
+            seen.add('id:' + s.id);
+            songs.push(s);
+          }
+        });
+        if (songs.length >= 24) break;
+      }
+    } catch (e) {
+      console.warn('[LocalEnrich] search failed:', kw, e.message);
+    }
+  }
+  return pickBestNeteaseMatch(songs, title, artistGuess, durationMs);
+}
+function ensureCoverParamUrl(coverUrl, size) {
+  size = size || 512;
+  const url = String(coverUrl || '');
+  if (!url) return '';
+  if (/[?&]param=\d+y\d+/i.test(url)) return url.replace(/([?&])param=\d+y\d+/i, '$1param=' + size + 'y' + size);
+  return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'param=' + size + 'y' + size;
+}
+async function downloadLocalCoverToFile(url, destPath) {
+  try {
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': UA, 'Referer': 'https://music.163.com/' },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!resp.ok || !resp.body) return { ok: false };
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (!buf.length) return { ok: false };
+    const tmp = destPath + '.tmp-' + Date.now();
+    fs.writeFileSync(tmp, buf);
+    fs.renameSync(tmp, destPath);
+    return { ok: true, bytes: buf.length };
+  } catch (e) {
+    console.warn('[LocalEnrich] cover download failed:', e.message);
+    return { ok: false };
+  }
+}
+async function fetchNeteaseLyricForMatch(id) {
+  let body = {};
+  let source = 'lyric';
+  try {
+    if (typeof lyric_new === 'function') {
+      const nr = await lyric_new({ id, cookie: userCookie, timestamp: Date.now() });
+      body = nr.body || {};
+      source = 'lyric_new';
+    }
+  } catch (errNew) {
+    console.warn('[LocalEnrich] lyric_new failed:', errNew.message);
+  }
+  if (!((body.lrc && body.lrc.lyric) || (body.yrc && body.yrc.lyric))) {
+    try {
+      const r = await lyric({ id, cookie: userCookie, timestamp: Date.now() });
+      body = r.body || body || {};
+      source = 'lyric';
+    } catch (e) {
+      console.warn('[LocalEnrich] lyric failed:', e.message);
+    }
+  }
+  const cap = (s, n) => String(s || '').slice(0, n);
+  return {
+    lrc: cap(body.lrc && body.lrc.lyric, 120 * 1024),
+    tlyric: cap(body.tlyric && body.tlyric.lyric, 120 * 1024),
+    yrc: cap(body.yrc && body.yrc.lyric, 400 * 1024),
+    source,
+  };
+}
+function localMetaFileMatches(meta, size, mtimeMs) {
+  if (!meta || !meta.file) return false;
+  if (meta.file.mtimeMs && mtimeMs && Math.abs(meta.file.mtimeMs - mtimeMs) > 1) return false;
+  if (meta.file.size && size && meta.file.size !== size) return false;
+  return true;
+}
+function localPublicMeta(meta) {
+  if (!meta) return null;
+  return {
+    status: meta.status || 'ok',
+    savedAt: meta.savedAt || 0,
+    file: meta.file || {},
+    match: meta.match || null,
+    lyric: meta.lyric || { lrc: '', tlyric: '', yrc: '' },
+    cover: meta.cover || { saved: false, bytes: 0 },
+  };
+}
+const localEnrichJobs = new Map(); // hash -> in-flight promise (去重 + 防止并发打爆接口)
+let localEnrichChain = Promise.resolve();
+function chainLocalEnrich(task) {
+  const run = localEnrichChain.then(task, task);
+  localEnrichChain = run.catch(() => {});
+  return run;
+}
+async function enrichLocalFileMeta(rawKey, opts) {
+  opts = opts || {};
+  const key = String(rawKey || '').trim().slice(0, 1200);
+  const hash = localMusicDirKey(key);
+  if (!key) return { ok: false, error: 'MISSING_KEY' };
+  if (localEnrichJobs.has(hash)) return localEnrichJobs.get(hash);
+  const job = chainLocalEnrich(async () => {
+    const now = Date.now();
+    const existing = readLocalMusicMeta(key);
+    if (existing && existing.status === 'ok' && !opts.force && localMetaFileMatches(existing, opts.size, opts.mtimeMs)) {
+      return { ok: true, cached: true, status: 'ok', meta: localPublicMeta(existing) };
+    }
+    if (existing && existing.status === 'nomatch' && !opts.force
+      && (existing.savedAt || 0) + LOCAL_ENRICH_NOMATCH_TTL_MS > now
+      && localMetaFileMatches(existing, opts.size, opts.mtimeMs)) {
+      return { ok: true, cached: true, status: 'nomatch', meta: localPublicMeta(existing) };
+    }
+    const fileName = String(opts.fileName || '');
+    const explicitTitle = String(opts.title || '').trim();
+    const explicitArtist = String(opts.artist || '').trim();
+    const baseTitle = stripAudioExtName(explicitTitle || fileName);
+    if (!baseTitle) {
+      writeLocalMusicMeta(key, {
+        v: 1, status: 'nomatch', savedAt: now,
+        file: { name: fileName, size: opts.size || 0, mtimeMs: opts.mtimeMs || 0, durationMs: opts.durationMs || 0 },
+      });
+      return { ok: true, cached: false, status: 'nomatch', meta: null };
+    }
+    // 依次尝试: 原始文件名 → "歌名 - 歌手" → "歌手 - 歌名" (避免把连字符当歌名)
+    const attempts = buildLocalMatchAttempts(baseTitle, explicitArtist);
+    let best = null;
+    let matchFrom = '';
+    // 1) 先查网易云“我喜欢的音乐”: 用户已收藏的歌曲带现成官方歌词/封面, 本地复用最快最准
+    if (userCookie) {
+      try {
+        const liked = await getNeteaseLikedSongsIndex(!!opts.force);
+        if (liked && liked.length) {
+          for (const attempt of attempts) {
+            const likedSong = matchLocalSongInLiked(liked, attempt.title, attempt.artist, opts.durationMs);
+            if (likedSong) {
+              best = { song: likedSong, candName: likedSong.name, candArtist: likedSong.artist, tR: 1, aR: 1 };
+              matchFrom = 'liked';
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[LocalEnrich] liked index failed:', e.message);
+      }
+    }
+    // 2) 云端搜索兜底
+    if (!best) {
+      for (const attempt of attempts) {
+        const found = await neteaseSearchBestMatch(attempt.title, attempt.artist, opts.durationMs);
+        if (found && found.song && found.song.id != null) { best = found; matchFrom = 'search'; break; }
+      }
+    }
+    if (!best || !best.song || best.song.id == null) {
+      writeLocalMusicMeta(key, {
+        v: 1, status: 'nomatch', savedAt: now,
+        file: { name: fileName, size: opts.size || 0, mtimeMs: opts.mtimeMs || 0, durationMs: opts.durationMs || 0 },
+      });
+      return { ok: true, cached: false, status: 'nomatch', meta: null };
+    }
+    const song = best.song;
+    const matchedTitle = song.name || baseTitle;
+    const matchedArtist = best.candArtist || best.artistGuess || explicitArtist;
+    // liked 索引里的记录是平铺字段 (album/cover 为字符串), cloudsearch 是 al/album 对象, 统一兼容
+    const albumRaw = (song.al || song.album) || {};
+    const albumName = (typeof albumRaw === 'string') ? albumRaw : (albumRaw.name || '');
+    const coverRemote = (typeof albumRaw === 'string' ? '' : (albumRaw.picUrl || albumRaw.coverUrl || '')) || song.cover || song.picUrl || '';
+    const matched = {
+      id: song.id,
+      name: matchedTitle,
+      artist: matchedArtist,
+      album: albumName,
+      coverRemote,
+      duration: song.dt || song.duration || 0,
+      from: matchFrom,
+    };
+    const lyric = await fetchNeteaseLyricForMatch(matched.id);
+    const meta = {
+      v: 1,
+      status: 'ok',
+      savedAt: now,
+      file: { name: fileName, size: opts.size || 0, mtimeMs: opts.mtimeMs || 0, durationMs: opts.durationMs || 0 },
+      match: matched,
+      lyric,
+      cover: { saved: false, bytes: 0, fetchedAt: 0 },
+    };
+    if (matched.coverRemote) {
+      ensureLocalMusicDirs();
+      const coverRes = await downloadLocalCoverToFile(ensureCoverParamUrl(matched.coverRemote, 512), localCoverFilePath(key));
+      if (coverRes.ok) {
+        meta.cover = { saved: true, bytes: coverRes.bytes || 0, fetchedAt: Date.now() };
+      }
+    }
+    writeLocalMusicMeta(key, meta);
+    return { ok: true, cached: false, status: 'ok', meta: localPublicMeta(meta) };
+  });
+  localEnrichJobs.set(hash, job);
+  try {
+    return await job;
+  } finally {
+    localEnrichJobs.delete(hash);
+  }
+}
+async function streamLocalCover(res, key) {
+  const meta = readLocalMusicMeta(key);
+  const filePath = localCoverFilePath(key);
+  if (meta && meta.cover && meta.cover.saved && fs.existsSync(filePath)) {
+    res.writeHead(200, {
+      'Content-Type': 'image/jpeg',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'public, max-age=604800',
+      'Content-Length': fs.statSync(filePath).size,
+    });
+    fs.createReadStream(filePath).pipe(res);
+    return true;
+  }
+  res.writeHead(404, { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+  res.end();
+  return false;
+}
+
+// ====================================================================
 //  HTTP Server
 // ====================================================================
 const server = http.createServer(async (req, res) => {
@@ -4332,6 +4828,64 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ---------- 本地音乐 · 网易云匹配缓存 ----------
+  if (pn === '/api/local/enrich') {
+    if (req.method !== 'POST') { sendJSON(res, { ok: false, error: 'POST_ONLY' }, 405); return; }
+    try {
+      const body = await readRequestBody(req);
+      const key = String((body && body.key) || '').trim().slice(0, 1200);
+      if (!key) { sendJSON(res, { ok: false, error: 'MISSING_KEY' }, 400); return; }
+      const result = await enrichLocalFileMeta(key, {
+        fileName: String((body && body.fileName) || ''),
+        title: String((body && body.title) || ''),
+        artist: String((body && body.artist) || ''),
+        durationMs: Math.max(0, Number((body && body.durationMs) || 0) || 0),
+        size: Math.max(0, Number((body && body.size) || 0) || 0),
+        mtimeMs: Math.max(0, Number((body && body.mtimeMs) || 0) || 0),
+        force: !!(body && body.force),
+      });
+      sendJSON(res, result);
+    } catch (err) {
+      console.error('[LocalEnrich]', err);
+      sendJSON(res, { ok: false, error: err.message || 'LOCAL_ENRICH_FAILED' }, 500);
+    }
+    return;
+  }
+
+  if (pn === '/api/local/meta') {
+    try {
+      const key = String(url.searchParams.get('key') || '').trim().slice(0, 1200);
+      if (!key) { sendJSON(res, { ok: false, error: 'MISSING_KEY' }, 400); return; }
+      const meta = readLocalMusicMeta(key);
+      if (!meta) { sendJSON(res, { ok: true, cached: false, status: 'missing', meta: null }); return; }
+      const mtimeMs = Math.max(0, Number(url.searchParams.get('mtimeMs') || 0) || 0);
+      const size = Math.max(0, Number(url.searchParams.get('size') || 0) || 0);
+      sendJSON(res, {
+        ok: true,
+        cached: true,
+        status: meta.status || 'ok',
+        fresh: localMetaFileMatches(meta, size, mtimeMs),
+        meta: localPublicMeta(meta),
+      });
+    } catch (err) {
+      console.error('[LocalMeta]', err);
+      sendJSON(res, { ok: false, error: err.message || 'LOCAL_META_FAILED' }, 500);
+    }
+    return;
+  }
+
+  if (pn === '/api/local/cover') {
+    try {
+      const key = String(url.searchParams.get('key') || '').trim().slice(0, 1200);
+      if (!key) { res.writeHead(400, { 'Access-Control-Allow-Origin': '*' }); res.end('Missing key'); return; }
+      await streamLocalCover(res, key);
+    } catch (err) {
+      console.error('[LocalCover]', err);
+      if (!res.headersSent) { res.writeHead(500, { 'Access-Control-Allow-Origin': '*' }); res.end(); }
+    }
+    return;
+  }
+
   // ---------- 歌曲评论 ----------
   if (pn === '/api/song/comments') {
     try {
@@ -4771,6 +5325,38 @@ const server = http.createServer(async (req, res) => {
       }
       sendJSON(res, { ok: true });
     } catch (e) { sendJSON(res, { ok: false, error: e.message }); }
+    return;
+  }
+
+  // ---------- 本地扫描存档（服务端镜像） ----------
+  // localStorage 里的扫描结果有两处不可靠：① 端口漂移会换 origin（3000 被占时走 3001），
+  // ② 曲库大时 ar1s-local-scan-store-v1 会撞上 ~5MB 配额静默写入失败。凡是这两种情况，
+  // 用户看到的就是「本地音乐扫描有时候丢了」。所以额外在 userData/local-music-cache 下
+  // 存一份与 origin 无关的副本，启动时作为兜底。
+  if (pn === '/api/local/scan-store') {
+    const storeFile = path.join(LOCAL_MUSIC_DIR, 'scan-store.json');
+    try {
+      if (req.method === 'GET') {
+        if (!fs.existsSync(storeFile)) { sendJSON(res, { ok: true, store: null }); return; }
+        const parsed = JSON.parse(fs.readFileSync(storeFile, 'utf8'));
+        sendJSON(res, { ok: true, store: (parsed && parsed.folderPath && Array.isArray(parsed.files)) ? parsed : null });
+        return;
+      }
+      if (req.method === 'POST') {
+        const body = await readRequestBody(req);
+        const store = body && body.store;
+        if (!store || !store.folderPath || !Array.isArray(store.files) || !store.files.length) {
+          try { if (fs.existsSync(storeFile)) fs.unlinkSync(storeFile); } catch (e) {}
+          sendJSON(res, { ok: true, cleared: true });
+          return;
+        }
+        fs.mkdirSync(LOCAL_MUSIC_DIR, { recursive: true });
+        fs.writeFileSync(storeFile, JSON.stringify(store));
+        sendJSON(res, { ok: true, count: store.files.length });
+        return;
+      }
+    } catch (e) { sendJSON(res, { ok: false, error: e.message }); return; }
+    sendJSON(res, { ok: false, error: 'METHOD_NOT_ALLOWED' });
     return;
   }
 
