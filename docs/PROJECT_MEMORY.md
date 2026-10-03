@@ -402,3 +402,11 @@
   - B 站相关：`maybeShowBiliModeNotice()`（切到 bili 搜索模式时 `showSourceFallbackNotice`，5s 自动关，`hideBiliModeNoticeIfOurs()` 避免误关真正的换源提示）；`body.bili-video-mode #empty-home` 纯 CSS 收起主页杂项，`goHome()` 加视频模式守卫。
   - 壁纸模式：新增 `#wp-overlay`（fixed inset:0 z-index:64，含 `#wp-overlay-bg/video/veil/inner`），`applyWallpaperOverlay(on)` 只切 DOM/class，`applyWallpaperModeState()` 先本地生效再走 IPC；歌词卡拉OK用单元素 `-webkit-background-clip:text` + `--wp-p` 变量，`filter:drop-shadow` 而非 text-shadow；主进程 `wallpaperSuppressed/wallpaperAttached` 止血（attach 失败即压制、窗口关闭后置 `enabled:false`，杜绝每 ~1.6s 重建全屏窗）。
 - 禁止回退或改坏的点：不要把 `readSavedLyricLayout()` 里的 `raw.*` 改回裸 `fx.*`；不要为「修 Hero 变暗」去抬高 `.home-hero` 底色 alpha 或 `::before` 的 opacity（那是 `.home-hero/.home-card/.home-tile/.home-mosaic-cell` 共用的玻璃基线，会连累整个主页）；不要恢复 `#top-right` 的 B 站按钮或「我的播客」标签；不要让 `enterBiliVideoMode()` 调用 `dismissHomePage()`（会把 `homeSuppressed` 置上，退出视频后主页回不来）；不要删掉 `#wp-overlay` 上的点击/ESC 关闭兜底（不透明全屏层必须永远关得掉）；壁纸模式的 `wallpaperAttached/wallpaperSuppressed` 守卫不要退回「每 tick setBounds + 自动重建」。
+
+### 2026-10-03 - Hero 背景图改回原图品质 (v1.3.2)
+
+- 用户明确要求：主页 Hero 背景图不要任何特效，要按原图品质显示（v1.3.1 加的 scrim 遮罩反而让画面更暗）。
+- 涉及文件：`public/index.html`、`package.json`/`package-lock.json`、`CHANGELOG.md`。
+- 关键参数/实现：`.home-hero-bg.has-bg{opacity:1}`（删掉 `filter:saturate(1.14) contrast(1.05) brightness(1.03)`）；删除 `HOME_HERO_BG_SCRIM` 渐变常量，`applyHomeHeroBgImage(url)` 只写 `bgEl.style.backgroundImage = 'url("' + url + '")'`；可读性改由 `.home-hero-bg.has-bg ~ .home-hero-inner .home-title/.home-sub/.home-chip` 的 `text-shadow` 承担（只加在文字上，图片不受影响）。
+- 验证方式：离屏 Electron 注入 1600x900 纯色 PNG（`#1e88e5`）→ `capturePage()` 取 45 点采样，全部为 `rgb(29,132,222)`（与源色偏差 ≤7，属截图色彩管线误差），左边缘/底部不再有压暗梯度；`computedFilter=none`、`computedOpacity=1`、背景层 `gradient` 计数为 0。注意离屏截图是 1.5x，采样必须按 `captureWidth / window.innerWidth` 换算；`.home-hero-bg` 有 `transition:opacity .5s`，读计算值前要先把 `style.transition` 设成 `none`。
+- 禁止回退或改坏的点：不要再给 `.home-hero-bg` 加任何遮罩/filter，也不要把它降回 0.52/0.62 透明度（用户要的就是原图）；要保可读性只能动文字或按钮自身的样式。

@@ -237,7 +237,11 @@ body.home-wallpaper-preview #canvas-container{filter:none}
 .home-hero::before{content:'';position:absolute;inset:0;background:linear-gradient(118deg,rgba(255,255,255,.060),transparent 24%,rgba(255,83,103,.070) 54%,rgba(122,215,194,.055) 82%,transparent 100%),linear-gradient(90deg,rgba(255,255,255,.032) 0 1px,transparent 1px 48px),linear-gradient(0deg,rgba(255,255,255,.024) 0 1px,transparent 1px 44px);opacity:.72;pointer-events:none}
 .home-hero::after{content:'';position:absolute;left:28px;right:28px;bottom:22px;height:1px;background:linear-gradient(90deg,color-mix(in srgb,var(--home-accent) 0%,transparent),color-mix(in srgb,var(--home-accent) 52%,transparent),rgba(36,66,255,.24),rgba(248,244,238,.18),color-mix(in srgb,var(--home-accent) 0%,transparent));opacity:.82;pointer-events:none}
 .home-hero-bg{position:absolute;inset:0;background-size:cover;background-position:center;background-repeat:no-repeat;border-radius:28px;opacity:0.52;z-index:1;pointer-events:none;transition:opacity 0.5s ease}
-.home-hero-bg.has-bg{opacity:1;filter:saturate(1.14) contrast(1.05) brightness(1.03)}
+.home-hero-bg.has-bg{opacity:1}
+/* 背景图按原图品质显示（无遮罩、无 filter），可读性只加在文字自身上 */
+.home-hero-bg.has-bg ~ .home-hero-inner .home-title{text-shadow:0 10px 36px rgba(0,0,0,.42),0 2px 6px rgba(0,0,0,.34)}
+.home-hero-bg.has-bg ~ .home-hero-inner .home-sub{text-shadow:0 2px 12px rgba(0,0,0,.55),0 1px 3px rgba(0,0,0,.42)}
+.home-hero-bg.has-bg ~ .home-hero-inner .home-chip{text-shadow:0 1px 8px rgba(0,0,0,.5)}
 .home-hero-upload-btn{position:absolute;top:16px;right:16px;z-index:5;width:32px;height:32px;border-radius:50%;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.55);font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.18s;opacity:0}
 .home-hero:hover .home-hero-upload-btn,.home-hero-upload-btn:hover{opacity:1}
 .home-hero-upload-btn:hover{background:rgba(255,255,255,0.15);border-color:rgba(255,255,255,0.3);color:#fff}
@@ -2933,13 +2937,13 @@ var homeWeatherLoadPromise = null;
 var weatherRadioStartBusy = false;
 
 //   Home Hero 背景图片
-// 背景图本身以 opacity:1 显示（过去被压到 0.52/0.62，看起来又暗又不鲜艳），
-// 可读性改由压在图片之上的 scrim 渐变保证：左侧与底部加权，护住 AR1S 标题和 chip。
-var HOME_HERO_BG_SCRIM = 'linear-gradient(96deg,rgba(3,5,9,.70) 0%,rgba(3,5,9,.44) 36%,rgba(3,5,9,.18) 66%,rgba(3,5,9,.08) 100%),linear-gradient(0deg,rgba(3,5,9,.50) 0%,rgba(3,5,9,.12) 40%,rgba(3,5,9,0) 68%)';
+// 背景图按原图品质显示：opacity 1、不加 filter、不叠任何遮罩渐变。
+// 标题/chip 的可读性由文字自身的 text-shadow 保证（见 .home-hero-bg.has-bg ~ .home-hero-inner），
+// 不再通过压暗图片来实现。
 function applyHomeHeroBgImage(url) {
   var bgEl = document.getElementById("home-hero-bg");
   if (!bgEl || !url) return null;
-  bgEl.style.backgroundImage = HOME_HERO_BG_SCRIM + ', url("' + url + '")';
+  bgEl.style.backgroundImage = 'url("' + url + '")';
   bgEl.classList.add("has-bg");
   return bgEl;
 }
